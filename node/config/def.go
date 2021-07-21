@@ -50,11 +50,22 @@ type Backup struct {
 type StorageMiner struct {
 	Common
 
+	Subsystems MinerSubsystemConfig
 	Dealmaking DealmakingConfig
 	Sealing    SealingConfig
 	Storage    sectorstorage.SealerConfig
 	Fees       MinerFeeConfig
 	Addresses  MinerAddressConfig
+}
+
+type MinerSubsystemConfig struct {
+	EnableMining        bool
+	EnableSealing       bool
+	EnableSectorStorage bool
+	EnableMarkets       bool
+
+	SealerApiInfo      string // if EnableSealing == false
+	SectorIndexApiInfo string // if EnableSectorStorage == false
 }
 
 type DealmakingConfig struct {
@@ -125,6 +136,13 @@ type SealingConfig struct {
 	// Run sector finalization before submitting sector proof to the chain
 	FinalizeEarly bool
 
+	// Whether to use available miner balance for sector collateral instead of sending it with each message
+	CollateralFromMinerBalance bool
+	// Minimum available balance to keep in the miner actor before sending it with messages
+	AvailableBalanceBuffer types.FIL
+	// Don't send collateral with messages even if there is no available balance in the miner actor
+	DisableCollateralFallback bool
+
 	// enable / disable precommit batching (takes effect after nv13)
 	BatchPreCommits bool
 	// maximum precommit batch size - batches will be sent immediately above this size
@@ -143,6 +161,10 @@ type SealingConfig struct {
 	CommitBatchWait Duration
 	// time buffer for forceful batch submission before sectors/deals in batch would start expiring
 	CommitBatchSlack Duration
+
+	// network BaseFee below which to stop doing commit aggregation, instead
+	// submitting proofs to the chain individually
+	AggregateAboveBaseFee types.FIL
 
 	TerminateBatchMax  uint64
 	TerminateBatchMin  uint64
@@ -178,9 +200,10 @@ type MinerFeeConfig struct {
 }
 
 type MinerAddressConfig struct {
-	PreCommitControl []string
-	CommitControl    []string
-	TerminateControl []string
+	PreCommitControl   []string
+	CommitControl      []string
+	TerminateControl   []string
+	DealPublishControl []string
 
 	// DisableOwnerFallback disables usage of the owner address for messages
 	// sent automatically
@@ -225,12 +248,9 @@ type Chainstore struct {
 }
 
 type Splitstore struct {
-	HotStoreType         string
-	TrackingStoreType    string
-	MarkSetType          string
-	EnableFullCompaction bool
-	EnableGC             bool // EXPERIMENTAL
-	Archival             bool
+	ColdStoreType string
+	HotStoreType  string
+	MarkSetType   string
 }
 
 // // Full Node
@@ -301,7 +321,9 @@ func DefaultFullNode() *FullNode {
 		Chainstore: Chainstore{
 			EnableSplitstore: false,
 			Splitstore: Splitstore{
-				HotStoreType: "badger",
+				ColdStoreType: "universal",
+				HotStoreType:  "badger",
+				MarkSetType:   "map",
 			},
 		},
 	}
@@ -319,6 +341,10 @@ func DefaultStorageMiner() *StorageMiner {
 			AlwaysKeepUnsealedCopy:    true,
 			FinalizeEarly:             false,
 
+			CollateralFromMinerBalance: false,
+			AvailableBalanceBuffer:     types.FIL(big.Zero()),
+			DisableCollateralFallback:  false,
+
 			BatchPreCommits:     true,
 			MaxPreCommitBatch:   miner5.PreCommitSectorBatchMaxSize, // up to 256 sectors
 			PreCommitBatchWait:  Duration(24 * time.Hour),           // this should be less than 31.5 hours, which is the expiration of a precommit ticket
@@ -329,6 +355,8 @@ func DefaultStorageMiner() *StorageMiner {
 			MaxCommitBatch:   miner5.MaxAggregatedSectors, // maximum 819 sectors, this is the maximum aggregation per FIP13
 			CommitBatchWait:  Duration(24 * time.Hour),    // this can be up to 30 days
 			CommitBatchSlack: Duration(1 * time.Hour),     // time buffer for forceful batch submission before sectors/deals in batch would start expiring, higher value will lower the chances for message fail due to expiration
+
+			AggregateAboveBaseFee: types.FIL(types.BigMul(types.PicoFil, types.NewInt(150))), // 0.15 nFIL
 
 			TerminateBatchMin:  1,
 			TerminateBatchMax:  100,
@@ -378,6 +406,13 @@ func DefaultStorageMiner() *StorageMiner {
 			},
 		},
 
+		Subsystems: MinerSubsystemConfig{
+			EnableMining:        true,
+			EnableSealing:       true,
+			EnableSectorStorage: true,
+			EnableMarkets:       true,
+		},
+
 		Fees: MinerFeeConfig{
 			MaxPreCommitGasFee: types.MustParseFIL("0.025"),
 			MaxCommitGasFee:    types.MustParseFIL("0.05"),
@@ -398,8 +433,10 @@ func DefaultStorageMiner() *StorageMiner {
 		},
 
 		Addresses: MinerAddressConfig{
-			PreCommitControl: []string{},
-			CommitControl:    []string{},
+			PreCommitControl:   []string{},
+			CommitControl:      []string{},
+			TerminateControl:   []string{},
+			DealPublishControl: []string{},
 		},
 	}
 	cfg.Common.API.ListenAddress = "/ip4/127.0.0.1/tcp/2345/http"
